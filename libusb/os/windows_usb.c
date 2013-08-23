@@ -972,7 +972,7 @@ static int force_hcd_device_descriptor(struct libusb_device *dev)
 /*
  * fetch and cache all the config descriptors through I/O
  */
-static int cache_config_descriptors(struct libusb_device *dev, HANDLE hub_handle, char* device_id)
+static int cache_config_descriptors_from_ioctl(struct libusb_device *dev, HANDLE hub_handle, char* device_id)
 {
 	DWORD size, ret_size;
 	struct libusb_context *ctx = DEVICE_CTX(dev);
@@ -983,15 +983,6 @@ static int cache_config_descriptors(struct libusb_device *dev, HANDLE hub_handle
 	USB_CONFIGURATION_DESCRIPTOR_SHORT cd_buf_short;    // dummy request
 	PUSB_DESCRIPTOR_REQUEST cd_buf_actual = NULL;       // actual request
 	PUSB_CONFIGURATION_DESCRIPTOR cd_data = NULL;
-
-	if (dev->num_configurations == 0)
-		return LIBUSB_ERROR_INVALID_PARAM;
-
-	priv->config_descriptor = (unsigned char**) calloc(dev->num_configurations, sizeof(unsigned char*));
-	if (priv->config_descriptor == NULL)
-		return LIBUSB_ERROR_NO_MEM;
-	for (i=0; i<dev->num_configurations; i++)
-		priv->config_descriptor[i] = NULL;
 
 	for (i=0, r=LIBUSB_SUCCESS; ; i++)
 	{
@@ -1070,15 +1061,199 @@ static int cache_config_descriptors(struct libusb_device *dev, HANDLE hub_handle
 	return LIBUSB_SUCCESS;
 }
 
+static int cache_config_descriptors_from_winusb_subapi(struct libusb_device *dev, HANDLE file_handle, int sub_api) {
+	struct windows_device_priv *priv = _device_priv(dev);
+	DWORD size;
+	WINUSB_INTERFACE_HANDLE winusb_handle;
+	USB_CONFIGURATION_DESCRIPTOR config_desc_temp;
+	int r, i;
+
+	if (!WinUSBX[sub_api].initialized) {
+		return LIBUSB_ERROR_IO;
+	}
+	if (!WinUSBX[sub_api].Initialize(file_handle, &winusb_handle)) {
+		return LIBUSB_ERROR_IO;
+	}
+
+	for (i = 0, r = LIBUSB_SUCCESS; !r && i < dev->num_configurations; i++) {
+		// Call WinUsb_GetDescriptor with DescriptorType == USB_CONFIGURATION_DESCRIPTOR_TYPE.
+		size = sizeof(config_desc_temp);
+		if (WinUSBX[sub_api].GetDescriptor(winusb_handle, USB_CONFIGURATION_DESCRIPTOR_TYPE, 0, 0,
+			(PUCHAR) &config_desc_temp, size, &size)) {
+			PUCHAR cd_data;
+
+			size = config_desc_temp.wTotalLength;
+			cd_data = (PUCHAR) malloc(size);
+			if (WinUSBX[sub_api].GetDescriptor(winusb_handle, USB_CONFIGURATION_DESCRIPTOR_TYPE,
+				0, 0, cd_data, size, &size)) {
+				// Cache the descriptor
+				priv->config_descriptor[i] = cd_data;
+			}
+			else {
+				free(cd_data);
+				r = LIBUSB_ERROR_IO;
+			}
+		}
+	}
+	WinUSBX[sub_api].Free(winusb_handle);
+	return r;
+}
+
+static int cache_config_descriptors_from_winusb(struct libusb_device *dev, char* device_path) {
+	struct windows_device_priv *priv = _device_priv(dev);
+	HANDLE file_handle;
+	int r;
+
+	file_handle = CreateFileA(device_path, GENERIC_READ | GENERIC_WRITE,
+		FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+	if (file_handle == INVALID_HANDLE_VALUE)
+	{
+		usbi_dbg("couldn't open %s : %s", device_path, windows_error_str(0));
+		return LIBUSB_ERROR_IO;
+	}
+
+	r = cache_config_descriptors_from_winusb_subapi(dev, file_handle, priv->sub_api);
+	CloseHandle(file_handle);
+	return r;
+}
+
+static int cache_config_descriptors(struct libusb_device *dev, HANDLE hub_handle, char* device_id, char* device_path) {
+	int i, r;
+	struct windows_device_priv *priv = _device_priv(dev);
+
+	if (dev->num_configurations == 0)
+		return LIBUSB_ERROR_INVALID_PARAM;
+
+	priv->config_descriptor = (unsigned char**) calloc(dev->num_configurations, sizeof(unsigned char*));
+	if (priv->config_descriptor == NULL)
+		return LIBUSB_ERROR_NO_MEM;
+	for (i=0; i<dev->num_configurations; i++)
+		priv->config_descriptor[i] = NULL;
+
+	if (priv->apib->id == USB_API_WINUSBX)
+		r = cache_config_descriptors_from_winusb(dev, device_path);
+	else
+		r = cache_config_descriptors_from_ioctl(dev, hub_handle, device_id);
+	return r;
+}
+
+static void get_conn_info_ex(HANDLE hub_handle, USB_NODE_CONNECTION_INFORMATION_EX *conn_info_ex,
+  char* device_id, char* device_path, struct libusb_device* dev)
+{
+	struct libusb_context *ctx = DEVICE_CTX(dev);
+	struct windows_device_priv *priv = _device_priv(dev);
+
+	memcpy(&priv->dev_descriptor, &(conn_info_ex->DeviceDescriptor), sizeof(USB_DEVICE_DESCRIPTOR));
+	dev->num_configurations = priv->dev_descriptor.bNumConfigurations;
+	priv->active_config = conn_info_ex->CurrentConfigurationValue;
+	usbi_dbg("found %d configurations (active conf: %d)", dev->num_configurations, priv->active_config);
+	// If we can't read the config descriptors, just set the number of confs to zero
+	if (cache_config_descriptors(dev, hub_handle, device_id, device_path) != LIBUSB_SUCCESS) {
+		dev->num_configurations = 0;
+		priv->dev_descriptor.bNumConfigurations = 0;
+	}
+
+	if (conn_info_ex->DeviceAddress > UINT8_MAX) {
+		usbi_err(ctx, "program assertion failed: device address overflow");
+	}
+	dev->device_address = (uint8_t)conn_info_ex->DeviceAddress + 1;
+	if (dev->device_address == 1) {
+		usbi_err(ctx, "program assertion failed: device address collision with root hub");
+	}
+	switch (conn_info_ex->Speed) {
+	case 0: dev->speed = LIBUSB_SPEED_LOW; break;
+	case 1: dev->speed = LIBUSB_SPEED_FULL; break;
+	case 2: dev->speed = LIBUSB_SPEED_HIGH; break;
+	case 3: dev->speed = LIBUSB_SPEED_SUPER; break;
+	default:
+		usbi_warn(ctx, "Got unknown device speed %d", conn_info_ex->Speed);
+		break;
+	}
+}
+
+static int hub_has_broken_get_node_connection_information_ioctl(HANDLE hub_handle, uint8_t port_number)
+{
+	USB_NODE_CONNECTION_INFORMATION_EX conn_info_ex;
+	DWORD size = sizeof(conn_info_ex);
+
+	// Initialize the buffer to mostly garbage.
+	memset(&conn_info_ex, 0xee, sizeof(conn_info_ex));
+	conn_info_ex.ConnectionIndex = (ULONG)port_number;
+	if (!DeviceIoControl(hub_handle, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX, &conn_info_ex,
+		size, &conn_info_ex, size, &size, NULL)) {
+		// A failing DeviceIoControl is "working".
+		return 0;
+	}
+	// If the DeviceIoControl "succeeds", but leaves the memory uninitialized, it's broken.
+	// 0xee is an invalid length for a USB_DEVICE_DESCRIPTOR, so it's a safe check that the
+	// buffer is untouched.
+	return size == sizeof(conn_info_ex) && conn_info_ex.DeviceDescriptor.bLength == 0xee;
+}
+
+static int get_node_connection_information_from_winusb_subapi(struct libusb_device* dev,
+	USB_NODE_CONNECTION_INFORMATION_EX* conn_info_ex, HANDLE file_handle, int sub_api) {
+	struct libusb_context *ctx = DEVICE_CTX(dev);
+	DWORD size;
+	WINUSB_INTERFACE_HANDLE winusb_handle;
+	int r;
+
+	if (!WinUSBX[sub_api].initialized) {
+		return LIBUSB_ERROR_IO;
+	}
+	if (!WinUSBX[sub_api].Initialize(file_handle, &winusb_handle)) {
+		return LIBUSB_ERROR_IO;
+	}
+	r = LIBUSB_ERROR_IO;
+	size = sizeof(USB_DEVICE_DESCRIPTOR);
+	if (WinUSBX[sub_api].GetDescriptor(winusb_handle, USB_DEVICE_DESCRIPTOR_TYPE, 0, 0,
+		(PUCHAR) &conn_info_ex->DeviceDescriptor, size, &size)) {
+		r = LIBUSB_SUCCESS;
+		if (conn_info_ex->DeviceDescriptor.bNumConfigurations)
+		{
+			// This is possibly a lie, but it's not possible to query from WinUSB, and more than one
+			// configuration is unusual. Just log if more than one configuration is present.
+			if (conn_info_ex->DeviceDescriptor.bNumConfigurations > 1)
+				usbi_warn(ctx, "got %d configurations, assuming the first is used",
+					conn_info_ex->DeviceDescriptor.bNumConfigurations);
+			conn_info_ex->CurrentConfigurationValue = 1;
+			// Assume that any device queryable via WinUsb is connected.
+			conn_info_ex->ConnectionStatus = DeviceConnected;
+			// TODO(juanlang): DeviceIsHub and DeviceAddress are impossible to query via WinUsb, afaict.
+			// Leaving DeviceAddress at 0 causes a warning elsewhere, but seems otherwise harmless.
+			// The pipe information could be queried via further WinUsb calls, but they're ignored.
+		}
+		size = sizeof(UCHAR);
+		WinUSBX[sub_api].QueryDeviceInformation(winusb_handle, DEVICE_SPEED, &size, &conn_info_ex->Speed);
+	}
+	WinUSBX[sub_api].Free(winusb_handle);
+	return r;
+}
+
+static int get_node_connection_information_from_winusb(struct libusb_device* dev, char* device_path,
+	USB_NODE_CONNECTION_INFORMATION_EX* conn_info_ex)
+{
+	struct windows_device_priv *priv = _device_priv(dev);
+	HANDLE file_handle;
+	int r;
+
+	file_handle = CreateFileA(device_path, GENERIC_READ | GENERIC_WRITE,
+		FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+	if (file_handle == INVALID_HANDLE_VALUE)
+	{
+		usbi_dbg("couldn't open %s : %s", device_path, windows_error_str(0));
+		return LIBUSB_ERROR_IO;
+	}
+	r = get_node_connection_information_from_winusb_subapi(dev, conn_info_ex, file_handle, priv->sub_api);
+	CloseHandle(file_handle);
+	return r;
+}
+
 /*
  * Populate a libusbx device structure
  */
 static int init_device(struct libusb_device* dev, struct libusb_device* parent_dev,
 					   uint8_t port_number, char* device_id, DWORD devinst)
 {
-	HANDLE handle;
-	DWORD size;
-	USB_NODE_CONNECTION_INFORMATION_EX conn_info;
 	struct windows_device_priv *priv, *parent_priv;
 	struct libusb_context *ctx = DEVICE_CTX(dev);
 	struct libusb_device* tmp_dev;
@@ -1122,64 +1297,82 @@ static int init_device(struct libusb_device* dev, struct libusb_device* parent_d
 	if (dev->device_address != 0) {
 		return LIBUSB_SUCCESS;
 	}
-	memset(&conn_info, 0, sizeof(conn_info));
-	if (priv->depth != 0) {	// Not a HCD hub
-		handle = CreateFileA(parent_priv->path, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
-			FILE_FLAG_OVERLAPPED, NULL);
-		if (handle == INVALID_HANDLE_VALUE) {
-			usbi_warn(ctx, "could not open hub %s: %s", parent_priv->path, windows_error_str(0));
-			return LIBUSB_ERROR_ACCESS;
-		}
-		size = sizeof(conn_info);
-		conn_info.ConnectionIndex = (ULONG)port_number;
-		if (!DeviceIoControl(handle, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX, &conn_info, size,
-			&conn_info, size, &size, NULL)) {
+	if (priv->depth == 0) {	// Is a HCD hub
+		dev->device_address = 1;	// root hubs are set to use device number 1
+		force_hcd_device_descriptor(dev);
+	}
+
+	usbi_dbg("(bus: %d, addr: %d, depth: %d, port: %d): '%s'",
+		dev->bus_number, dev->device_address, priv->depth, priv->port, device_id);
+
+	return LIBUSB_SUCCESS;
+}
+
+static int cache_device_descriptors(struct libusb_device* dev, struct libusb_device* parent_dev,
+					   uint8_t port_number, char* device_id, char* device_path, DWORD devinst)
+{
+	HANDLE handle;
+	DWORD size;
+	USB_NODE_CONNECTION_INFORMATION_EX conn_info_ex;
+	struct windows_device_priv *priv, *parent_priv;
+	struct libusb_context *ctx = DEVICE_CTX(dev);
+	BOOL loaded_conn_info = FALSE, should_try_winusb = FALSE;
+
+	if ((dev == NULL) || (parent_dev == NULL)) {
+		return LIBUSB_ERROR_NOT_FOUND;
+	}
+	priv = _device_priv(dev);
+	parent_priv = _device_priv(parent_dev);
+	if (parent_priv->apib->id != USB_API_HUB) {
+		usbi_warn(ctx, "parent for device '%s' is not a hub", device_id);
+		return LIBUSB_ERROR_NOT_FOUND;
+	}
+
+	handle = CreateFileA(parent_priv->path, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+		FILE_FLAG_OVERLAPPED, NULL);
+	if (handle == INVALID_HANDLE_VALUE) {
+		usbi_warn(ctx, "could not open hub %s: %s", parent_priv->path, windows_error_str(0));
+		return LIBUSB_ERROR_ACCESS;
+	}
+	memset(&conn_info_ex, 0, sizeof(conn_info_ex));
+	size = sizeof(conn_info_ex);
+	conn_info_ex.ConnectionIndex = (ULONG)port_number;
+	if (!DeviceIoControl(handle, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX, &conn_info_ex,
+		size, &conn_info_ex, size, &size, NULL)) {
+		// Retry with winusb for winusb devices.
+		if (priv->apib->id == USB_API_WINUSBX)
+			should_try_winusb = TRUE;
+		else
+		{
 			usbi_warn(ctx, "could not get node connection information for device '%s': %s",
 				device_id, windows_error_str(0));
 			safe_closehandle(handle);
 			return LIBUSB_ERROR_NO_DEVICE;
 		}
-		if (conn_info.ConnectionStatus == NoDeviceConnected) {
-			usbi_err(ctx, "device '%s' is no longer connected!", device_id);
-			safe_closehandle(handle);
-			return LIBUSB_ERROR_NO_DEVICE;
-		}
-		memcpy(&priv->dev_descriptor, &(conn_info.DeviceDescriptor), sizeof(USB_DEVICE_DESCRIPTOR));
-		dev->num_configurations = priv->dev_descriptor.bNumConfigurations;
-		priv->active_config = conn_info.CurrentConfigurationValue;
-		usbi_dbg("found %d configurations (active conf: %d)", dev->num_configurations, priv->active_config);
-		// If we can't read the config descriptors, just set the number of confs to zero
-		if (cache_config_descriptors(dev, handle, device_id) != LIBUSB_SUCCESS) {
-			dev->num_configurations = 0;
-			priv->dev_descriptor.bNumConfigurations = 0;
-		}
-		safe_closehandle(handle);
-
-		if (conn_info.DeviceAddress > UINT8_MAX) {
-			usbi_err(ctx, "program assertion failed: device address overflow");
-		}
-		dev->device_address = (uint8_t)conn_info.DeviceAddress + 1;
-		if (dev->device_address == 1) {
-			usbi_err(ctx, "program assertion failed: device address collision with root hub");
-		}
-		switch (conn_info.Speed) {
-		case 0: dev->speed = LIBUSB_SPEED_LOW; break;
-		case 1: dev->speed = LIBUSB_SPEED_FULL; break;
-		case 2: dev->speed = LIBUSB_SPEED_HIGH; break;
-		case 3: dev->speed = LIBUSB_SPEED_SUPER; break;
-		default:
-			usbi_warn(ctx, "Got unknown device speed %d", conn_info.Speed);
-			break;
-		}
-	} else {
-		dev->device_address = 1;	// root hubs are set to use device number 1
-		force_hcd_device_descriptor(dev);
 	}
+	else if (conn_info_ex.ConnectionStatus == NoDeviceConnected)
+	{
+		// NoDeviceConnected is 0, so NoDeviceConnected could appear if the ioctl "succeeds" but fails
+		// to update the buffer.  (Some Texas Instruments-provided USB 3 drivers are broken in this way.)
+		// For broken ioctl implementations, retry with WinUsb.
+		if (priv->apib->id == USB_API_WINUSBX &&
+			hub_has_broken_get_node_connection_information_ioctl(handle, port_number))
+			should_try_winusb = TRUE;
+		else
+			usbi_err(ctx, "device '%s' is no longer connected?", device_id);
+	}
+	else
+		loaded_conn_info = TRUE;
+	if (should_try_winusb)
+	{
+		if (!get_node_connection_information_from_winusb(dev, device_path, &conn_info_ex))
+			loaded_conn_info = TRUE;
+	}
+	if (loaded_conn_info)
+		get_conn_info_ex(handle, &conn_info_ex, device_id, device_path, dev);
+	safe_closehandle(handle);
 
 	usbi_sanitize_device(dev);
-
-	usbi_dbg("(bus: %d, addr: %d, depth: %d, port: %d): '%s'",
-		dev->bus_number, dev->device_address, priv->depth, priv->port, device_id);
 
 	return LIBUSB_SUCCESS;
 }
@@ -1517,7 +1710,6 @@ static int windows_get_device_list(struct libusb_context *ctx, struct discovered
 			// Find parent device (for the passes that need it)
 			switch (pass) {
 			case HCD_PASS:
-			case DEV_PASS:
 			case HUB_PASS:
 				break;
 			default:
@@ -1589,13 +1781,18 @@ static int windows_get_device_list(struct libusb_context *ctx, struct discovered
 				break;
 			case HUB_PASS:
 			case DEV_PASS:
+				// Take care of API initialization. These might be re-initialized on multiple passes, but doing so
+				// is harmless.
+				priv->apib = &usb_api_backend[api];
+				priv->sub_api = sub_api;
+				// In dev pass only, once the api/sub api of each device is known, cache the descriptors for the device.
+				if (pass == DEV_PASS)
+					cache_device_descriptors(dev, parent_dev, (uint8_t)port_nr, dev_id_path,
+						dev_interface_path, dev_info_data.DevInst);
 				// If the device has already been setup, don't do it again
 				if (priv->path != NULL)
 					break;
-				// Take care of API initialization
 				priv->path = dev_interface_path; dev_interface_path = NULL;
-				priv->apib = &usb_api_backend[api];
-				priv->sub_api = sub_api;
 				switch(api) {
 				case USB_API_COMPOSITE:
 				case USB_API_HUB:
